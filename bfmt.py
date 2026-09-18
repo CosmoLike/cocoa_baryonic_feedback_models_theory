@@ -36,6 +36,7 @@ AVAILABLE_BARYON_MODELS = {
     2: "BCEmu",
     3: "FlamingoBaryonResponseEmulator",
     4: "BACCOemu",
+    5: "BCemu2025",
 }
 
 class bfmt(Theory):
@@ -62,6 +63,8 @@ class bfmt(Theory):
     #   "unity": S = 1, no feedback (default)
     #   "constant": S clamped to its value at the model's zmax
     above_zmax: str = "unity"
+    # BCemu2025 only: q2 interpolation coordinate (native grid: 0.5, 0.7, 1.0)
+    q2_bcemu25: float = 0.70
 
     def initialize(self):
         """
@@ -89,6 +92,10 @@ class bfmt(Theory):
                 "eta_bcemu": None,
                 "deta_bcemu": None,
             }
+            # Load the emulator files once; the baryon fraction fb = Ob/Om
+            # (the only cosmology dependence) is updated at every sample via
+            # update_cosmology() in _calculate_bcemu
+            self.bcemulator = BCemu.BCM_7param(verbose=False)
         elif self.baryon_model == 3: # FlamingoEmulator
             self.params = {
                 "fgas_sigma_flamingo": None,
@@ -104,8 +111,29 @@ class bfmt(Theory):
                 "theta_inn_baccoemu": None,
             }
             self.baccoemulator = baccoemu.Matter_powerspectrum(baryonic_model_name='Burger2025')
+        elif self.baryon_model == 5: # BCemu2025
+            self.params = {
+                "Theta_co_bcemu25": None,
+                "log10Mc_bcemu25": None,
+                "mu_bcemu25": None,
+                "delta_bcemu25": None,
+                "eta_bcemu25": None,
+                "deta_bcemu25": None,
+                "Nstar_bcemu25": None,
+            }
+            # Load the emulator files once; fb = Ob/Om (the only cosmology
+            # dependence) enters the parameter dict at every sample
+            self.bcemulator25 = BCemu.BCemu2025(backend='numpy')
+            q2lo = float(self.bcemulator25.q2_grid.min())
+            q2hi = float(self.bcemulator25.q2_grid.max())
+            if not (q2lo <= self.q2_bcemu25 <= q2hi):
+                raise LoggedError(
+                    self.log,
+                    f"Invalid `q2_bcemu25`={self.q2_bcemu25}; the BCemu2025 "
+                    f"grid covers q2 in [{q2lo}, {q2hi}]",
+                )
         else:
-            raise LoggedError(self.log, f"Invalid choice of `baryon_model`. Available options are 1 (SP(k), 2 (BCEmu), or 3 (FlamingoEmulator))")
+            raise LoggedError(self.log, f"Invalid choice of `baryon_model`. Available options are 1 (SP(k)), 2 (BCEmu), 3 (FlamingoEmulator), 4 (BACCOemu), or 5 (BCemu2025)")
         
         if self.above_zmax not in ("unity", "constant"):
             raise LoggedError(
@@ -149,6 +177,17 @@ class bfmt(Theory):
         self.beta_baccoemu_min, self.beta_baccoemu_max = -1, 0.7
         self.M1_z0_cen_baccoemu_min, self.M1_z0_cen_baccoemu_max = 9, 13
         self.theta_inn_baccoemu_min, self.theta_inn_baccoemu_max = -2, 0
+
+        # Parameter validation bounds for BCemu2025 (training LHC ranges,
+        # recovered from the emulator's input StandardScaler: mean +- sqrt(3)*std)
+        self.Theta_co_bcemu25_min, self.Theta_co_bcemu25_max = 0.0, 0.8
+        self.log10Mc_bcemu25_min, self.log10Mc_bcemu25_max = 11.0, 15.0
+        self.mu_bcemu25_min, self.mu_bcemu25_max = 0.0, 3.0
+        self.delta_bcemu25_min, self.delta_bcemu25_max = 2.0, 12.0
+        self.eta_bcemu25_min, self.eta_bcemu25_max = -0.2, 0.2
+        self.deta_bcemu25_min, self.deta_bcemu25_max = 0.0, 0.4
+        self.Nstar_bcemu25_min, self.Nstar_bcemu25_max = 0.0, 0.05
+        self.fb_bcemu25_min, self.fb_bcemu25_max = 0.10, 0.20
 
         self.log.debug(
             "BaryonSuppression: Initialized with baryon_model=%d, "
@@ -265,9 +304,10 @@ class bfmt(Theory):
             return
 
         # Highest z each model can evaluate; above it, suppression is unity
-        zmax_model = {1: self.z_max_calib, 2: 2.0, 3: 3.0, 4: 3.0}.get(
-            self.baryon_model, np.inf
-        )
+        zmax_table = {1: self.z_max_calib, 2: 2.0, 3: 3.0, 4: 3.0}
+        if self.baryon_model == 5:
+            zmax_table[5] = float(self.bcemulator25.z_grid.max())
+        zmax_model = zmax_table.get(self.baryon_model, np.inf)
         z_top = min(z_out.max(), zmax_model)
 
         if z_top <= z_out.min():
@@ -297,9 +337,11 @@ class bfmt(Theory):
             suppression_dict = self._calculate_flamingo(params_values_dict, z_int, k_int)
         elif self.baryon_model == 4:
             suppression_dict = self._calculate_baccoemu(params_values_dict, z_int, k_int)
+        elif self.baryon_model == 5:
+            suppression_dict = self._calculate_bcemu2025(params_values_dict, z_int, k_int)
         else:
             self.log.error(
-                "baryon_model=%d is invalid; must be 1 (pyspk), 2 (bcemu), 3 (flamingo), or 4 (BACCOemu); "
+                "baryon_model=%d is invalid; must be 1 (pyspk), 2 (bcemu), 3 (flamingo), 4 (BACCOemu), or 5 (BCemu2025); "
                 "returning unity suppression",
                 self.baryon_model,
             )
@@ -643,9 +685,13 @@ class bfmt(Theory):
                 "deta": deta_bcemu,
             }
 
-            bfcemu = BCemu.BCM_7param(
-                Ob=self.provider.get_param("omegab"),
-                Om=self.provider.get_param("omegam"),
+            # The emulator files were loaded once in initialize(); the only
+            # cosmology dependence is the baryon fraction fb = Ob/Om, which
+            # BCemu exposes as a per-call update
+            bfcemu = self.bcemulator
+            bfcemu.update_cosmology(
+                self.provider.get_param("omegab"),
+                self.provider.get_param("omegam"),
             )
             # Training-set k range (h/Mpc), read from the emulator itself so
             # BCEmu is never asked to extrapolate outside its training set
@@ -916,6 +962,79 @@ class bfmt(Theory):
                 assume_sorted=True,
             )
             sup_interp = np.exp(interp_bacco(np.log10(k_arr) - np.log10(h)))
+            suppression_dict[z_val] = sup_interp
+
+        return suppression_dict
+
+    def _calculate_bcemu2025(self, params_values_dict, z_arr, k_arr):
+        """
+        Compute suppression factors using the BCemu2025 emulator.
+
+        The emulator was loaded once in initialize(); the baryon fraction
+        fb = Ob/Om (the only cosmology dependence) enters the parameter dict
+        at every sample. The q2 coordinate is the yaml option `q2_bcemu25`.
+
+        Args:
+            params_values_dict (dict): sampled *_bcemu25 parameters.
+
+        Returns:
+            dict: {z_val: suppression_array} for each requested redshift.
+        """
+        # 1. Fetch and validate sampled parameters; reject invalid samples
+        vals = {}
+        for name in ("Theta_co", "log10Mc", "mu", "delta", "eta", "deta", "Nstar"):
+            v = params_values_dict.get(f"{name}_bcemu25")
+            vmin = getattr(self, f"{name}_bcemu25_min")
+            vmax = getattr(self, f"{name}_bcemu25_max")
+            if not (vmin < v < vmax):
+                return self._reject_sample(
+                    f"BCemu2025 parameter {name}_bcemu25={v:.4f} outside valid "
+                    f"range [{vmin:.4f}, {vmax:.4f}]"
+                )
+            vals[name] = v
+
+        # 2. Baryon fraction from the provider; part of the training box
+        h = self.provider.get_param("H0") / 100
+        fb = self.provider.get_param("omegab") / self.provider.get_param("omegam")
+        if not (self.fb_bcemu25_min < fb < self.fb_bcemu25_max):
+            return self._reject_sample(
+                f"BCemu2025 baryon fraction fb=Ob/Om={fb:.4f} outside the "
+                f"training range [{self.fb_bcemu25_min:.4f}, {self.fb_bcemu25_max:.4f}]"
+            )
+        vals["fb"] = fb
+
+        # 3. Compute suppression at each internal redshift on the emulator's
+        #    native k grid, then interpolate onto the requested grid
+        emu = self.bcemulator25
+        kmin_emu = float(np.min(emu.k))  # h/Mpc
+        suppression_dict = {}
+        for i_z, z_val in enumerate(z_arr):
+            try:
+                k_emu, sup_emu = emu.get_boost(vals, z_val, q2=self.q2_bcemu25)
+            except Exception as e:
+                self.log.error(
+                    "BCemu2025 failed at z=%.3f: %s; "
+                    "using unity suppression for this redshift",
+                    z_val,
+                    str(e),
+                )
+                suppression_dict[z_val] = np.ones_like(k_arr)
+                continue
+
+            interp_emu = interp1d(
+                np.log10(k_emu),
+                np.log(sup_emu),
+                kind="linear",
+                fill_value="extrapolate",
+                bounds_error=False,
+                assume_sorted=True,
+            )
+            # k_arr is in 1/Mpc but BCemu2025 assumes h/Mpc units
+            sup_interp = np.exp(interp_emu(np.log10(k_arr) - np.log10(h)))
+
+            # No feedback on scales below the training range
+            sup_interp[k_arr < h * kmin_emu] = 1.0
+
             suppression_dict[z_val] = sup_interp
 
         return suppression_dict
