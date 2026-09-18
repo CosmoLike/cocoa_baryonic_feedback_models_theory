@@ -59,7 +59,8 @@ likelihood:
 `projects/roman_real/EXAMPLE_EVALUATE1.yaml` is a working example. For a dark-matter-only
 comparison, set `external_baryon_suppression: False`.
 
-> **Note.** Behavior outside the models' validity ranges.
+> [!Warning]
+> Behavior outside the models' validity ranges.
 >
 > 1. Calibration redshift ranges: SP(k) z in [0.125, 3]; BCEmu z in [0, 2]; Flamingo
 >    z in [0, 3]; BACCOemu z below 3 (a >= 0.25). Above these ranges the theory block
