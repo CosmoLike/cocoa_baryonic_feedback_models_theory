@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / OS
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
