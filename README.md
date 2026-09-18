@@ -1,7 +1,7 @@
 # External Baryonic Feedback Models
 
 This repository implements external baryonic feedback suppression models as the `Cobaya`
-theory block `bfmt`, used alongside Cosmolike. The theory block provides the product
+theory block `bfmt` (Baryonic Feedback Model Theory), used alongside Cosmolike. The theory block provides the product
 `baryon_suppression`: the ratio $S(k,z)$ that the likelihood applies to the nonlinear
 matter power spectrum, $P_\mathrm{nl}(k,z) = S(k,z) \, P_\mathrm{DMO}(k,z)$. The
 implemented models are
