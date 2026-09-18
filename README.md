@@ -32,6 +32,30 @@ checking*.
       #export IGNORE_BACCOEMU_CODE=1  # BACCOemu
       #export IGNORE_BFMT_CODE=1      # Baryon Feedback Theory Block (this repository)
 
+      (...)
+
+      export BFMT_THEORY_URL="https://github.com/CosmoLike/cocoa_baryonic_feedback_models_theory.git"
+      export BFMT_NAME="baryon_suppression"
+      #export BFMT_GIT_TAG="v1.0"
+
+      (...)
+
+      export PYSPK_URL="https://github.com/jemme07/pyspk.git"
+      export PYSPK_GIT_COMMIT="50737f9295fee75ef2fe97e4bdd284134ed0d474"
+      export PYSPK_NAME="pyspk"
+
+      export BCEMU_URL="https://github.com/sambit-giri/BCemu.git"
+      export BCEMU_GIT_COMMIT="c32577654e1b48b4bdf079c01a26b16f1473598f"
+      export BCEMU_NAME="bcemu"
+
+      export FBRE_URL="https://github.com/FLAMINGOSIM/FlamingoBaryonResponseEmulator.git"
+      export FBRE_GIT_COMMIT="76b259cd44d28d9ab24b5f08ffaf536a9d4c41d7"
+      export FBRE_NAME="fbre"
+
+      export BACCOEMU_URL="https://bitbucket.org/rangulo/baccoemu.git"
+      export BACCOEMU_GIT_COMMIT="2dfea6e3960fe0239c1d56480f952c3da7e9843b"
+      export BACCOEMU_NAME="baccoemu"
+
 > [!Warning]
 > Do not `pip install` the emulators directly. Cocoa pins their commits and seeds their
 > Python dependencies with guarded versions; a direct pip install can upgrade
@@ -39,7 +63,7 @@ checking*.
 
 ## Usage
 
-Baryonic feedback requires two switches in the YAML file.
+Baryonic feedback requires three additions to the YAML file.
 
 **Step :one:**: add the theory block and select the model:
 
@@ -47,10 +71,12 @@ Baryonic feedback requires two switches in the YAML file.
 theory:
   bfmt:
     baryon_model: 1 # 1 = SP(k), 2 = BCEmu, 3 = FlamingoEmulator, 4 = BACCOemu
-    #nz: 20  # internal (z, k) computation grid; the result is 2D-splined
-    #nk: 100 # onto the grid the likelihood requests
-    #above_zmax: unity # S(k,z) above the model range: unity (default) or constant
+    nz: 20  # internal (z, k) computation grid; the result is 2D-splined
+    nk: 100 # onto the grid the likelihood requests
+    above_zmax: unity # S(k,z) above the model range: unity (default) or constant
 ```
+
+The values above are the defaults; `baryon_model` is the only required key.
 
 **Step :two:**: enable the correction on the Cosmolike likelihood:
 
@@ -69,8 +95,9 @@ likelihood:
 | 3 | Flamingo | `fgas_sigma_flamingo`, `mstar_sigma_flamingo`, `jet_frac_flamingo` |
 | 4 | BACCOemu | `M_c_baccoemu`, `eta_baccoemu`, `beta_baccoemu`, `M1_z0_cen_baccoemu`, `theta_inn_baccoemu` |
 
-`projects/roman_real/EXAMPLE_EVALUATE1.yaml` is a working example. For a dark-matter-only
-comparison, set `external_baryon_suppression: False`.
+`projects/roman_real/EXAMPLE_EVALUATE1.yaml` is a working example with every `bfmt` key
+set explicitly. For a dark-matter-only comparison, set
+`external_baryon_suppression: False`.
 
 > [!Warning]
 > Behavior outside the models' validity ranges.
@@ -94,3 +121,10 @@ changes to the core Cosmolike code. The likelihood requests `baryon_suppression`
 $(k, z)$ interpolation grid ($k$ in $1/\mathrm{Mpc}$; the theory block converts to
 $h/\mathrm{Mpc}$ internally) and, in `_cosmolike_prototype_base.py`, multiplies the
 nonlinear power spectrum by $S(k,z)$ after it is computed in `set_cosmo_related()`.
+
+The theory block does not evaluate the feedback model on the full requested grid.
+It computes $S$ on the internal `nz` $\times$ `nk` grid and 2D-splines
+$\ln S$ over $(z, \log_{10} k)$ onto the requested grid — the same strategy Cobaya
+uses for its matter-power-spectrum interpolator. Emulators are never asked to
+extrapolate outside their training ranges in $k$: below the training minimum the
+suppression is set to $S = 1$ (no feedback on large scales).
