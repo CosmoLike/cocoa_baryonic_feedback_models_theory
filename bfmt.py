@@ -58,6 +58,10 @@ class bfmt(Theory):
     # same spirit as Cobaya's matter-power-spectrum interpolator
     nz: int = 20
     nk: int = 100
+    # S(k,z) for z above the selected model's calibration range:
+    #   "unity": S = 1, no feedback (default)
+    #   "constant": S clamped to its value at the model's zmax
+    above_zmax: str = "unity"
 
     def initialize(self):
         """
@@ -103,6 +107,13 @@ class bfmt(Theory):
         else:
             raise LoggedError(self.log, f"Invalid choice of `baryon_model`. Available options are 1 (SP(k), 2 (BCEmu), or 3 (FlamingoEmulator))")
         
+        if self.above_zmax not in ("unity", "constant"):
+            raise LoggedError(
+                self.log,
+                f"Invalid `above_zmax`='{self.above_zmax}'. Available options: "
+                "'unity' (S=1; default) or 'constant' (clamp S to its value at zmax)",
+            )
+
         self.requested_z = np.array([])
         self.requested_k = np.array([])
 
@@ -261,14 +272,20 @@ class bfmt(Theory):
 
         if z_top <= z_out.min():
             # every requested redshift is above the model range
-            state["baryon_suppression"] = {
-                z_val: np.ones_like(k_out) for z_val in z_out
-            }
-            return
+            if self.above_zmax == "unity":
+                state["baryon_suppression"] = {
+                    z_val: np.ones_like(k_out) for z_val in z_out
+                }
+                return
+            # "constant": still evaluate the model in a narrow band ending at
+            # its zmax, so the clamped S(k, zmax) row exists below
+            z_lo = max(0.0, z_top - 0.25)
+        else:
+            z_lo = z_out.min()
 
         nz = max(4, min(int(self.nz), len(z_out)))
         nk = max(4, min(int(self.nk), len(k_out)))
-        z_int = np.linspace(z_out.min(), z_top, nz)
+        z_int = np.linspace(z_lo, z_top, nz)
         k_int = np.logspace(np.log10(k_out.min()), np.log10(k_out.max()), nk)
 
         # Route to appropriate baryon model (computed on the internal grid)
@@ -305,9 +322,17 @@ class bfmt(Theory):
         )
         log10k_out = np.log10(k_out)
         result = {}
+        row_above_zmax = None
         for z_val in z_out:
             if z_val > z_top:
-                result[z_val] = np.ones_like(k_out)
+                # `above_zmax` option: "unity" (default) -> S = 1;
+                # "constant" -> S clamped to its value at the model's zmax
+                if row_above_zmax is None:
+                    if self.above_zmax == "constant":
+                        row_above_zmax = np.exp(spline(z_top, log10k_out)[0])
+                    else:
+                        row_above_zmax = np.ones_like(k_out)
+                result[z_val] = row_above_zmax.copy()
             else:
                 result[z_val] = np.exp(spline(z_val, log10k_out)[0])
 
