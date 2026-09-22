@@ -89,6 +89,21 @@ class bfmt(Theory):
     above_zmax: str = "unity"
     # BCemu2025 only: q2 interpolation coordinate (native grid: 0.5, 0.7, 1.0)
     q2_bcemu25: float = 0.70
+    # SP(k) only: which fb - M_halo relation feeds the suppression fit
+    #   1 = power law           fb = fb_a (M / fb_pivot_spk)^fb_pow
+    #   2 = Akino et al. 2022   fb = e^alpha/100 (M/1e14)^(beta-1) (E(z)/E(0.3))^gamma
+    #   3 = double power law    fb = eps/2 (E(z)/E(0.3))^gamma [(M/m_pivot)^alpha + (M/m_pivot)^beta]
+    # (pyspk's fourth relation, binned M_halo/fb arrays, is not wired yet)
+    spk_fb_model: int = 2
+    # Pivot masses in M_sun: conventions of the relation, not sampled
+    # parameters (the Akino pivot is fixed at 1e14 inside pyspk).
+    # NOTE: pyspk's own schema default for fb_pivot is 1.0 M_sun, which
+    # makes fb = fb_a (M/1)^fb_pow astronomically large for any cluster
+    # mass and pushes every sample outside the calibration limits; the
+    # 10^13.5 M_sun default below is the pivot of pyspk's documented
+    # power-law example.
+    fb_pivot_spk: float = 10.0**13.5  # power law
+    m_pivot_spk: float = 1.0e14       # double power law
 
     def initialize(self):
         """
@@ -101,11 +116,33 @@ class bfmt(Theory):
         """
         # Define the parameters this theory class needs to evaluate.
         if self.baryon_model == 1: # SP(k)
-            self.params = {
-                "alpha_spk": None,  # Alpha parameter for pyspk model
-                "beta_spk": None,   # Beta parameter for pyspk model
-                "gamma_spk": None,  # Gamma parameter for pyspk model
-            }
+            # The sampled parameters depend on the selected fb - M_halo
+            # relation; the pivot masses are class options, not params
+            if self.spk_fb_model == 1:   # power-law relation
+                self.params = {
+                    "fb_a_spk": None,    # fb at the pivot mass
+                    "fb_pow_spk": None,  # power-law exponent
+                }
+            elif self.spk_fb_model == 2: # Akino et al. 2022 relation
+                self.params = {
+                    "alpha_spk": None,  # Alpha parameter for pyspk model
+                    "beta_spk": None,   # Beta parameter for pyspk model
+                    "gamma_spk": None,  # Gamma parameter for pyspk model
+                }
+            elif self.spk_fb_model == 3: # double power-law relation
+                self.params = {
+                    "epsilon_spk": None,  # overall normalization
+                    "alpha_spk": None,    # low-mass slope
+                    "beta_spk": None,     # high-mass slope
+                    "gamma_spk": None,    # E(z) evolution exponent
+                }
+            else:
+                raise LoggedError(
+                    self.log,
+                    f"Invalid choice of `spk_fb_model`. Available options "
+                    f"are 1 (power law), 2 (Akino et al. 2022), or 3 "
+                    f"(double power law)",
+                )
         elif self.baryon_model == 2: # BCemu
             self.params = {
                 "log10Mc_bcemu": None,
@@ -177,9 +214,26 @@ class bfmt(Theory):
 
         # Parameter validation bounds (3-sigma conservative from YAML priors)
         # Expected ranges: alpha ~4.18±0.12, beta ~1.26±0.08, gamma ~0.42±0.10
+        # (Akino et al. 2022 relation, spk_fb_model = 2)
         self.alpha_min, self.alpha_max = 3.8, 4.6
         self.beta_min, self.beta_max = 1.0, 1.6
         self.gamma_min_spk, self.gamma_max_spk = 0.1, 0.75
+
+        # Power-law relation (spk_fb_model = 1): fb_a is a baryon
+        # fraction at the pivot mass, fb_pow a mild slope. These boxes
+        # are deliberately loose; the hard guard is pyspk's own
+        # calibration limit on the resulting fb(M, z), which raises and
+        # falls back to unity for that redshift.
+        self.fb_a_min, self.fb_a_max = 0.0, 1.0
+        self.fb_pow_min, self.fb_pow_max = -2.0, 2.0
+
+        # Double power-law relation (spk_fb_model = 3): normalization,
+        # low/high-mass slopes, and E(z) evolution exponent; same hard
+        # guard from pyspk's calibration limits applies
+        self.epsilon_min, self.epsilon_max = 0.0, 2.0
+        self.alpha_min_dpl, self.alpha_max_dpl = -5.0, 5.0
+        self.beta_min_dpl, self.beta_max_dpl = -5.0, 5.0
+        self.gamma_min_dpl, self.gamma_max_dpl = -5.0, 5.0
 
         # Parameter validation bounds for BCEmu (based on Giri+ 2021 and reasonable extensions)
         self.log10Mc_min, self.log10Mc_max = 11.0, 15.0
@@ -288,14 +342,16 @@ class bfmt(Theory):
                 self.requested_k.max(),
             )
 
-            if self.baryon_model == 1:
-                # SP(k)'s cosmology-based relation needs E(z) = H(z)/H0.
-                # Ask the Boltzmann provider for H at z = 0, at the
-                # calibration floor (the clamp target for low z), and at
-                # every requested redshift, so the expansion history is
-                # the sampled one instead of a separate astropy model.
+            if self.baryon_model == 1 and self.spk_fb_model in (2, 3):
+                # The cosmology-based fb relations need E(z) = H(z)/H0.
+                # Ask the Boltzmann provider for H at z = 0, at pyspk's
+                # reference redshift 0.3 (both relations scale with
+                # E(z)/E(0.3)), at the calibration floor (the clamp
+                # target for low z), and at every requested redshift, so
+                # the expansion history is the sampled one instead of a
+                # separate astropy model.
                 z_req = np.unique(np.concatenate(
-                    ([0.0, self.z_min_calib], self.requested_z)))
+                    ([0.0, 0.3, self.z_min_calib], self.requested_z)))
                 self._hubble_z_req = z_req
                 return {"Hubble": {"z": z_req}}
 
@@ -443,58 +499,120 @@ class bfmt(Theory):
         and calibration masking.
 
         Args:
-            params_values_dict (dict): {"alpha_spk": float, "beta_spk": float, "gamma_spk": float}
+            params_values_dict (dict): the sampled parameters of the
+                selected fb - M_halo relation (spk_fb_model):
+                1 = {"fb_a_spk", "fb_pow_spk"}
+                2 = {"alpha_spk", "beta_spk", "gamma_spk"}
+                3 = {"epsilon_spk", "alpha_spk", "beta_spk", "gamma_spk"}
 
         Returns:
             dict: {z_val: suppression_array} for each requested redshift.
                   Returns unity suppression dict on any error.
         """
         try:
-            # 1. Fetch sampled baryon parameters
-            alpha = params_values_dict.get("alpha_spk", 4.18)
-            beta = params_values_dict.get("beta_spk", 1.26)
-            gamma = params_values_dict.get("gamma_spk", 0.42)
-
-            self.log.debug(
-                "SPk baryon suppression: alpha=%.4f, beta=%.4f, gamma=%.4f",
-                alpha,
-                beta,
-                gamma,
-            )
-
-            # 2. Validate parameters are within acceptable ranges (3-sigma bounds)
-            # Reject invalid samples via _reject_sample (calculate() then returns False -> -inf)
-            if not (self.alpha_min < alpha < self.alpha_max):
-                return self._reject_sample(
-                    f"SPk parameter alpha_spk={alpha:.4f} outside valid range"
-                    f"[{self.alpha_min:.4f}, {self.alpha_max:.4f}]",
+            # 1. Fetch the sampled fb - M_halo relation parameters and
+            #    validate them against the boxes set in initialize().
+            #    Rejections go through _reject_sample (calculate() then
+            #    returns False -> -inf). pyspk enforces a "provide only
+            #    one relation" precedence rule, so exactly one kwargs
+            #    set is built here.
+            if self.spk_fb_model == 1:
+                # power law: fb = fb_a (M / fb_pivot)^fb_pow, no cosmology
+                fb_a = params_values_dict.get("fb_a_spk", 0.4)
+                fb_pow = params_values_dict.get("fb_pow_spk", 0.3)
+                self.log.debug(
+                    "SPk power-law fb relation: fb_a=%.4f, fb_pow=%.4f, "
+                    "fb_pivot=%.4e", fb_a, fb_pow, self.fb_pivot_spk)
+                if not (self.fb_a_min < fb_a < self.fb_a_max):
+                    return self._reject_sample(
+                        f"SPk parameter fb_a_spk={fb_a:.4f} outside valid range "
+                        f"[{self.fb_a_min:.4f}, {self.fb_a_max:.4f}]",
+                    )
+                if not (self.fb_pow_min < fb_pow < self.fb_pow_max):
+                    return self._reject_sample(
+                        f"SPk parameter fb_pow_spk={fb_pow:.4f} outside valid range "
+                        f"[{self.fb_pow_min:.4f}, {self.fb_pow_max:.4f}]",
+                    )
+                spk_kwargs = dict(fb_a=fb_a, fb_pow=fb_pow,
+                                  fb_pivot=self.fb_pivot_spk)
+            elif self.spk_fb_model == 2:
+                # Akino et al. 2022:
+                #   fb = e^alpha/100 (M/1e14)^(beta-1) (E(z)/E(0.3))^gamma
+                alpha = params_values_dict.get("alpha_spk", 4.18)
+                beta = params_values_dict.get("beta_spk", 1.26)
+                gamma = params_values_dict.get("gamma_spk", 0.42)
+                self.log.debug(
+                    "SPk baryon suppression: alpha=%.4f, beta=%.4f, gamma=%.4f",
+                    alpha,
+                    beta,
+                    gamma,
                 )
+                # 3-sigma conservative bounds from the YAML priors
+                if not (self.alpha_min < alpha < self.alpha_max):
+                    return self._reject_sample(
+                        f"SPk parameter alpha_spk={alpha:.4f} outside valid range"
+                        f"[{self.alpha_min:.4f}, {self.alpha_max:.4f}]",
+                    )
+                if not (self.beta_min < beta < self.beta_max):
+                    return self._reject_sample(
+                        f"SPk parameter beta_spk={beta:.4f} outside valid range "
+                        f"[{self.beta_min:.4f}, {self.beta_max:.4f}]",
+                    )
+                if not (self.gamma_min_spk < gamma < self.gamma_max_spk):
+                    return self._reject_sample(
+                        f"SPk parameter gamma_spk={gamma:.4f} outside valid range "
+                        f"[{self.gamma_min_spk:.4f}, {self.gamma_max_spk:.4f}]",
+                    )
+                spk_kwargs = dict(alpha=alpha, beta=beta, gamma=gamma)
+            else:
+                # double power law: fb = eps/2 (E(z)/E(0.3))^gamma
+                #                     [(M/m_pivot)^alpha + (M/m_pivot)^beta]
+                epsilon = params_values_dict.get("epsilon_spk", 0.3)
+                alpha = params_values_dict.get("alpha_spk", 1.1)
+                beta = params_values_dict.get("beta_spk", 0.2)
+                gamma = params_values_dict.get("gamma_spk", 0.5)
+                self.log.debug(
+                    "SPk double power-law fb relation: epsilon=%.4f, "
+                    "alpha=%.4f, beta=%.4f, gamma=%.4f, m_pivot=%.4e",
+                    epsilon, alpha, beta, gamma, self.m_pivot_spk)
+                if not (self.epsilon_min < epsilon < self.epsilon_max):
+                    return self._reject_sample(
+                        f"SPk parameter epsilon_spk={epsilon:.4f} outside valid range "
+                        f"[{self.epsilon_min:.4f}, {self.epsilon_max:.4f}]",
+                    )
+                if not (self.alpha_min_dpl < alpha < self.alpha_max_dpl):
+                    return self._reject_sample(
+                        f"SPk parameter alpha_spk={alpha:.4f} outside valid range "
+                        f"[{self.alpha_min_dpl:.4f}, {self.alpha_max_dpl:.4f}]",
+                    )
+                if not (self.beta_min_dpl < beta < self.beta_max_dpl):
+                    return self._reject_sample(
+                        f"SPk parameter beta_spk={beta:.4f} outside valid range "
+                        f"[{self.beta_min_dpl:.4f}, {self.beta_max_dpl:.4f}]",
+                    )
+                if not (self.gamma_min_dpl < gamma < self.gamma_max_dpl):
+                    return self._reject_sample(
+                        f"SPk parameter gamma_spk={gamma:.4f} outside valid range "
+                        f"[{self.gamma_min_dpl:.4f}, {self.gamma_max_dpl:.4f}]",
+                    )
+                spk_kwargs = dict(epsilon=epsilon, alpha=alpha, beta=beta,
+                                  gamma=gamma, m_pivot=self.m_pivot_spk)
 
-            if not (self.beta_min < beta < self.beta_max):
-                return self._reject_sample(
-                    f"SPk parameter beta_spk={beta:.4f} outside valid range "
-                    f"[{self.beta_min:.4f}, {self.beta_max:.4f}]",
-                )
-
-            if not (self.gamma_min_spk < gamma < self.gamma_max_spk):
-                return self._reject_sample(
-                    f"SPk parameter gamma_spk={gamma:.4f} outside valid range "
-                    f"[{self.gamma_min_spk:.4f}, {self.gamma_max_spk:.4f}]",
-                )
-
-            # 3. Fetch H0 (for the k-unit conversion below) and E(z)
-            #    from the Boltzmann provider: the same expansion history
-            #    the sampled model integrates, at the z grid declared in
+            # 2. Fetch H0 (for the k-unit conversion below); the two
+            #    cosmology-based relations also get E(z) from the
+            #    Boltzmann provider - the same expansion history the
+            #    sampled model integrates, at the z grid declared in
             #    must_provide
             H0 = self.provider.get_param("H0")
             h = H0/100
-            cosmo = _EfuncFromProvider(
-                self._hubble_z_req,
-                self.provider.get_Hubble(self._hubble_z_req))
+            if self.spk_fb_model in (2, 3):
+                spk_kwargs["cosmo"] = _EfuncFromProvider(
+                    self._hubble_z_req,
+                    self.provider.get_Hubble(self._hubble_z_req))
+                self.log.debug(
+                    "SPk cosmology: H0=%.3f, E(z) from provider", H0)
 
-            self.log.debug("SPk cosmology: H0=%.3f, E(z) from provider", H0)
-
-            # 4. Compute suppression for each requested redshift
+            # 3. Compute suppression for each requested redshift
             suppression_dict = {}
 
             for i_z, z_val in enumerate(z_arr):
@@ -519,11 +637,8 @@ class bfmt(Theory):
                     k_spk, sup_spk = spk.sup_model(
                         SO=500,  # Spherical overdensity radius
                         z=z_eval,
-                        alpha=alpha,
-                        beta=beta,
-                        gamma=gamma,
-                        cosmo=cosmo,
                         verbose=False,
+                        **spk_kwargs,
                     )
 
                 except Exception as e:
