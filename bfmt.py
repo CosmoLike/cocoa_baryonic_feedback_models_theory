@@ -27,7 +27,6 @@ import BCemu
 import FlamingoBaryonResponseEmulator as fre
 import baccoemu
 from scipy.interpolate import interp1d, RectBivariateSpline
-from astropy.cosmology import FlatLambdaCDM
 from cobaya.theory import Theory
 from cobaya.log import LoggedError
 
@@ -38,6 +37,31 @@ AVAILABLE_BARYON_MODELS = {
     4: "BACCOemu",
     5: "BCemu2025",
 }
+
+
+class _EfuncFromProvider:
+    """The dimensionless Hubble parameter E(z) = H(z)/H0 of the sample.
+
+    pyspk's cosmology-based relation (Akino et al. 2022) calls exactly
+    one method on the object it receives: cosmo.efunc(z). This thin
+    wrapper backs that call with the Boltzmann provider's own H(z), so
+    the expansion history is the one the sampled model integrates
+    (w0waCDM, massive neutrinos, ...); an astropy FlatLambdaCDM built
+    from (H0, Om0) cannot represent those.
+    """
+
+    def __init__(self, z_grid, hubble_grid):
+        # store sorted copies: np.interp requires ascending x values
+        order = np.argsort(z_grid)
+        self._z = np.asarray(z_grid, dtype=float)[order]
+        self._hubble = np.asarray(hubble_grid, dtype=float)[order]
+        # H0 = H(z=0); must_provide always puts z = 0 on the grid
+        self._H0 = float(np.interp(0.0, self._z, self._hubble))
+
+    def efunc(self, z):
+        # linear interpolation is exact here: the grid carries the
+        # exact z values the suppression code evaluates
+        return float(np.interp(z, self._z, self._hubble)) / self._H0
 
 class bfmt(Theory):
     """
@@ -264,6 +288,17 @@ class bfmt(Theory):
                 self.requested_k.max(),
             )
 
+            if self.baryon_model == 1:
+                # SP(k)'s cosmology-based relation needs E(z) = H(z)/H0.
+                # Ask the Boltzmann provider for H at z = 0, at the
+                # calibration floor (the clamp target for low z), and at
+                # every requested redshift, so the expansion history is
+                # the sampled one instead of a separate astropy model.
+                z_req = np.unique(np.concatenate(
+                    ([0.0, self.z_min_calib], self.requested_z)))
+                self._hubble_z_req = z_req
+                return {"Hubble": {"z": z_req}}
+
     def calculate(self, state, want_derived=True, **params_values_dict):
         """
         Compute baryon suppression factors and store in state.
@@ -447,13 +482,17 @@ class bfmt(Theory):
                     f"[{self.gamma_min_spk:.4f}, {self.gamma_max_spk:.4f}]",
                 )
 
-            # 3. Fetch cosmological parameters from provider (e.g., CAMB/CLASS)
+            # 3. Fetch H0 (for the k-unit conversion below) and E(z)
+            #    from the Boltzmann provider: the same expansion history
+            #    the sampled model integrates, at the z grid declared in
+            #    must_provide
             H0 = self.provider.get_param("H0")
             h = H0/100
-            omegam = self.provider.get_param("omegam")
-            cosmo = FlatLambdaCDM(H0=H0, Om0=omegam)
+            cosmo = _EfuncFromProvider(
+                self._hubble_z_req,
+                self.provider.get_Hubble(self._hubble_z_req))
 
-            self.log.debug("SPk cosmology: H0=%.3f, omegam=%.4f", H0, omegam)
+            self.log.debug("SPk cosmology: H0=%.3f, E(z) from provider", H0)
 
             # 4. Compute suppression for each requested redshift
             suppression_dict = {}
