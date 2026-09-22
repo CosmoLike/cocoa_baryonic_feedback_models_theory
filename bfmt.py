@@ -143,6 +143,24 @@ class bfmt(Theory):
                     f"are 1 (power law), 2 (Akino et al. 2022), or 3 "
                     f"(double power law)",
                 )
+            # Build the SP(k) evaluator once: it precomputes the k grid
+            # and the calibration-limit interpolators, so each sample of
+            # an MCMC run pays only the per-call relation evaluation
+            # (sup_model would redo that setup and its input validation
+            # on every call). The k grid fixes sup_model's own defaults,
+            # so the results are identical.
+            spk_relation_kind = {1: "power_law",
+                                 2: "cosmo_power_law",
+                                 3: "double_power_law"}
+            self.spk_evaluator = spk.build_sup_model_evaluator(
+                SO=500,  # Spherical overdensity radius
+                relation_kind=spk_relation_kind[self.spk_fb_model],
+                k_min=0.1,
+                k_max=8,
+                n=100,
+                z_out_of_range="raise",  # never hit: z is clamped to the
+                                         # calibration range before calls
+            )
         elif self.baryon_model == 2: # BCemu
             self.params = {
                 "log10Mc_bcemu": None,
@@ -633,11 +651,10 @@ class bfmt(Theory):
                 z_eval = max(z_val, self.z_min_calib)
 
                 try:
-                    # Call pyspk to compute suppression on its native k-grid
-                    k_spk, sup_spk = spk.sup_model(
-                        SO=500,  # Spherical overdensity radius
+                    # Compute the suppression on pyspk's native k-grid
+                    # through the evaluator prebuilt in initialize()
+                    k_spk, sup_spk = self.spk_evaluator(
                         z=z_eval,
-                        verbose=False,
                         **spk_kwargs,
                     )
 
